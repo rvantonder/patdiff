@@ -52,11 +52,11 @@ let compare_lines config ~prev ~next =
         | Error _ -> failwithf "External compare %S failed!" prog ()
       in
       let module P = Patience_diff.Make (struct
-                       type t = string [@@deriving sexp]
+          type t = string [@@deriving sexp]
 
-                       let hash = String.hash
-                       let compare = compare
-                     end)
+          let hash = String.hash
+          let compare = compare
+        end)
       in
       P.get_hunks ~transform ~context ~big_enough:line_big_enough ~prev ~next
   in
@@ -89,9 +89,9 @@ let compare_lines config ~prev ~next =
 ;;
 
 let warn_if_no_trailing_newline
-      ~warn_if_no_trailing_newline_in_both
-      (prev_file_newline, prev_file)
-      (next_file_newline, next_file)
+    ~warn_if_no_trailing_newline_in_both
+    (prev_file_newline, prev_file)
+    (next_file_newline, next_file)
   =
   let warn = eprintf "No newline at the end of %s\n%!" in
   match prev_file_newline, next_file_newline with
@@ -114,21 +114,25 @@ let compare_files (config : Configuration.t) ~prev_file ~next_file =
     ~prev:{ name = prev_file; text = prev }
     ~next:{ name = next_file; text = next }
     ~compare_assuming_text:(fun config ~prev ~next ->
-      let prev_lines, prev_file_newline = lines_of_contents prev.text in
-      let next_lines, next_file_newline = lines_of_contents next.text in
-      warn_if_no_trailing_newline
-        (prev_file_newline, prev.name)
-        (next_file_newline, next.name)
-        ~warn_if_no_trailing_newline_in_both:config.warn_if_no_trailing_newline_in_both;
-      compare_lines config ~prev:prev_lines ~next:next_lines)
+        let prev_lines, prev_file_newline = lines_of_contents prev.text in
+        let next_lines, next_file_newline = lines_of_contents next.text in
+        warn_if_no_trailing_newline
+          (prev_file_newline, prev.name)
+          (next_file_newline, next.name)
+          ~warn_if_no_trailing_newline_in_both:config.warn_if_no_trailing_newline_in_both;
+        let hunks =
+          compare_lines config ~prev:prev_lines ~next:next_lines in
+        List.iter hunks ~f:(fun hunk ->
+            Format.printf "Next start: %d@.Next size: %d@.End: %d@." hunk.next_start hunk.next_size (hunk.next_start + hunk.next_size));
+        hunks)
 ;;
 
 let binary_different_message
-      ~(config : Configuration.t)
-      ~prev_file
-      ~prev_is_binary
-      ~next_file
-      ~next_is_binary
+    ~(config : Configuration.t)
+    ~prev_file
+    ~prev_is_binary
+    ~next_file
+    ~next_is_binary
   =
   match config.location_style with
   | Diff ->
@@ -197,10 +201,10 @@ let diff_files config ~prev_file ~next_file =
 ;;
 
 let diff_strings
-      ?print_global_header
-      (config : Configuration.t)
-      ~(prev : Patdiff_core.diff_input)
-      ~(next : Patdiff_core.diff_input)
+    ?print_global_header
+    (config : Configuration.t)
+    ~(prev : Patdiff_core.diff_input)
+    ~(next : Patdiff_core.diff_input)
   =
   let lines { Patdiff_core.name = _; text } = String.split_lines text |> Array.of_list in
   let hunks =
@@ -209,7 +213,71 @@ let diff_strings
       ~prev
       ~next
       ~compare_assuming_text:(fun config ~prev ~next ->
-        compare_lines config ~prev:(lines prev) ~next:(lines next))
+          let lines_prev = lines prev in
+          let lines_next = lines next in
+          let hunks = compare_lines config ~prev:lines_prev ~next:lines_next in
+          let () =
+            let has_trailing_newline text = String.contains ~pos:(String.length text - 1) text '\n' in
+            let prev_file_no_trailing_newline = not (has_trailing_newline prev.text) in
+            let next_file_no_trailing_newline = not (has_trailing_newline next.text) in
+            if prev_file_no_trailing_newline || next_file_no_trailing_newline then
+              (* if file does not have newline, and start + size - 1 = number of lines in file without a newline, then add \... *)
+              begin
+                Format.printf "No newline at in prev or next...@.";
+                List.iter hunks ~f:(fun hunk ->
+                    Format.printf "Prev start: %d@.Prev size: %d@.End: %d@." hunk.prev_start hunk.prev_size (hunk.prev_start + hunk.prev_size);
+                    if
+                      Array.length lines_prev = (hunk.prev_start + hunk.prev_size - 1)
+                      || Array.length lines_next = (hunk.next_start + hunk.next_size - 1)
+                    then
+                      let open Patience_diff.Range in
+                      let correction = "\n\\ No newline at end of file" in
+                      List.last hunk.ranges
+                      |> function
+                        (* if last hunk range are the same *)
+                      | Some Same a ->
+                        Format.printf "Same case@.";
+                        let prev, next = Array.get a (Array.length a - 1) in
+                        Array.set a (Array.length a - 1) (prev^correction, next^correction)
+                      (* if the last hunk had things deleted *)
+                      | Some Prev a when prev_file_no_trailing_newline ->
+                        Format.printf "Prev case@.";
+                        let prev = Array.get a (Array.length a - 1) in
+                        Array.set a (Array.length a - 1) (prev^correction)
+                      | Some Next a when next_file_no_trailing_newline ->
+                        (* Prev has a newline, dest does not *)
+                        Format.printf "Next case@.";
+                        let next = Array.get a (Array.length a - 1) in
+                        Array.set a (Array.length a - 1) (next^correction)
+                      | Some Unified a ->
+                        Format.printf "Unified case@.";
+                        let unified = Array.get a (Array.length a - 1) in
+                        Array.set a (Array.length a - 1) (unified^correction)
+                      | Some Replace (a1, a2) ->
+                        Format.printf "Replace case@.";
+                        if prev_file_no_trailing_newline then
+                          (
+                            let prev = Array.get a1 (Array.length a1 - 1) in
+                            Array.set a1 (Array.length a1 - 1) (prev^correction)
+                          );
+                        if next_file_no_trailing_newline then
+                          (
+                            let next = Array.get a2 (Array.length a2 - 1) in
+                            Array.set a2 (Array.length a2 - 1) (next^correction)
+                          )
+                      | _ ->
+                        Format.printf "Other@.";
+                        ()
+                    else
+                      ())
+              end
+            else
+              begin
+                Format.printf "Newline at %d@." (String.length next.text);
+              end
+          in
+          hunks
+        )
   in
   if Comparison_result.has_no_diff hunks
   then `Same
