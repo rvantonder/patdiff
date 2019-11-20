@@ -17,7 +17,6 @@ val diff_dirs
 
 val diff_strings
   :  ?print_global_header:bool
-  -> ?patch_compatible_hunks:bool
   -> Configuration.t
   -> prev:Patdiff_core.diff_input
   -> next:Patdiff_core.diff_input

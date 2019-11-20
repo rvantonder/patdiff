@@ -24,8 +24,65 @@ let%test_unit _ =
   test "hello\nworld\n" ~expect:([| "hello"; "world" |], `With_trailing_newline)
 ;;
 
+let convert_to_patch_compatible_hunks ?prev_diff ?next_diff lines_prev lines_next hunks =
+  let open Patdiff_core in
+  let open Patience_diff.Hunk in
+  let open Patience_diff.Range in
+  if Option.is_none prev_diff || Option.is_none next_diff then
+    ()
+  else
+    let prev = Option.value_exn prev_diff in
+    let next = Option.value_exn next_diff in
+    let has_trailing_newline text =
+      try String.contains ~pos:(String.length text - 1) text '\n' with _ -> false
+    in
+    let prev_file_no_trailing_newline = not (has_trailing_newline prev.text) in
+    let next_file_no_trailing_newline = not (has_trailing_newline next.text) in
+    if prev_file_no_trailing_newline || next_file_no_trailing_newline then
+      (* if file does not have newline, and start + size - 1 = number of lines in file without a newline, then add \... *)
+      List.iter hunks ~f:(fun hunk ->
+          if
+            Array.length lines_prev = (hunk.prev_start + hunk.prev_size - 1)
+            || Array.length lines_next = (hunk.next_start + hunk.next_size - 1)
+          then
+            let correction = "\n\\ No newline at end of file" in
+            (* We can't just take the last because the second last might be a prev
+               that needs the message too (because for unrefined patdiff converts
+               the replace to a prev and a next). We can't just handle all ranges
+               in this hunk either, because some prev or next might be earlier
+               than the rest of the prev or nexts. *)
+            List.last hunk.ranges
+            |> function
+              (* if last hunk range are the same *)
+            | Some Same a ->
+              let prev, next = Array.get a (Array.length a - 1) in
+              Array.set a (Array.length a - 1) (prev^correction, next^correction)
+            (* if the last hunk had things deleted *)
+            | Some Prev a when prev_file_no_trailing_newline ->
+              let prev = Array.get a (Array.length a - 1) in
+              Array.set a (Array.length a - 1) (prev^correction)
+            | Some Next a when next_file_no_trailing_newline ->
+              (* Prev has a newline, dest does not *)
+              let next = Array.get a (Array.length a - 1) in
+              Array.set a (Array.length a - 1) (next^correction)
+            | Some Unified a ->
+              let unified = Array.get a (Array.length a - 1) in
+              Array.set a (Array.length a - 1) (unified^correction)
+            | Some Replace (a1, a2) ->
+              if prev_file_no_trailing_newline then
+                (
+                  let prev = Array.get a1 (Array.length a1 - 1) in
+                  Array.set a1 (Array.length a1 - 1) (prev^correction)
+                );
+              if next_file_no_trailing_newline then
+                (
+                  let next = Array.get a2 (Array.length a2 - 1) in
+                  Array.set a2 (Array.length a2 - 1) (next^correction)
+                )
+            | _ -> ())
+
 (* Returns a Hunk.t list, ready to be printed *)
-let compare_lines config ~prev ~next =
+let compare_lines config ?prev_diff ?next_diff ~prev ~next () =
   let module C = Configuration in
   (* Create the diff *)
   let context = config.C.context in
@@ -68,9 +125,13 @@ let compare_lines config ~prev ~next =
   (* Refine if desired *)
   if config.C.unrefined
   then
-    (* Turn `Replace ranges into `Prev and `Next ranges.
-       `Replace's would otherwise be later interpreted as refined output *)
-    Patience_diff.Hunks.unified hunks
+    (
+      (* Before turning replace ranges into `Prev and `Next, add the diff fixups *)
+      convert_to_patch_compatible_hunks ?prev_diff ?next_diff prev next hunks;
+      (* Turn `Replace ranges into `Prev and `Next ranges.
+         `Replace's would otherwise be later interpreted as refined output *)
+      Patience_diff.Hunks.unified hunks
+    )
   else (
     let rules = config.C.rules in
     let output = config.C.output in
@@ -120,7 +181,7 @@ let compare_files (config : Configuration.t) ~prev_file ~next_file =
           (prev_file_newline, prev.name)
           (next_file_newline, next.name)
           ~warn_if_no_trailing_newline_in_both:config.warn_if_no_trailing_newline_in_both;
-        compare_lines config ~prev:prev_lines ~next:next_lines)
+        compare_lines config ~prev:prev_lines ~next:next_lines ())
 ;;
 
 let binary_different_message
@@ -196,56 +257,8 @@ let diff_files config ~prev_file ~next_file =
   if Comparison_result.has_no_diff hunks then `Same else `Different
 ;;
 
-let convert_to_patch_compatible_hunks prev next lines_prev lines_next hunks =
-  let open Patdiff_core in
-  let open Patience_diff.Hunk in
-  let open Patience_diff.Range in
-  let has_trailing_newline text =
-    try String.contains ~pos:(String.length text - 1) text '\n' with _ -> false
-  in
-  let prev_file_no_trailing_newline = not (has_trailing_newline prev.text) in
-  let next_file_no_trailing_newline = not (has_trailing_newline next.text) in
-  if prev_file_no_trailing_newline || next_file_no_trailing_newline then
-    (* if file does not have newline, and start + size - 1 = number of lines in file without a newline, then add \... *)
-    List.iter hunks ~f:(fun hunk ->
-        if
-          Array.length lines_prev = (hunk.prev_start + hunk.prev_size - 1)
-          || Array.length lines_next = (hunk.next_start + hunk.next_size - 1)
-        then
-          let correction = "\n\\ No newline at end of file" in
-          List.last hunk.ranges
-          |> function
-            (* if last hunk range are the same *)
-          | Some Same a ->
-            let prev, next = Array.get a (Array.length a - 1) in
-            Array.set a (Array.length a - 1) (prev^correction, next^correction)
-          (* if the last hunk had things deleted *)
-          | Some Prev a when prev_file_no_trailing_newline ->
-            let prev = Array.get a (Array.length a - 1) in
-            Array.set a (Array.length a - 1) (prev^correction)
-          | Some Next a when next_file_no_trailing_newline ->
-            (* Prev has a newline, dest does not *)
-            let next = Array.get a (Array.length a - 1) in
-            Array.set a (Array.length a - 1) (next^correction)
-          | Some Unified a ->
-            let unified = Array.get a (Array.length a - 1) in
-            Array.set a (Array.length a - 1) (unified^correction)
-          | Some Replace (a1, a2) ->
-            if prev_file_no_trailing_newline then
-              (
-                let prev = Array.get a1 (Array.length a1 - 1) in
-                Array.set a1 (Array.length a1 - 1) (prev^correction)
-              );
-            if next_file_no_trailing_newline then
-              (
-                let next = Array.get a2 (Array.length a2 - 1) in
-                Array.set a2 (Array.length a2 - 1) (next^correction)
-              )
-          | _ -> ())
-
 let diff_strings
     ?print_global_header
-    ?patch_compatible_hunks
     (config : Configuration.t)
     ~(prev : Patdiff_core.diff_input)
     ~(next : Patdiff_core.diff_input)
@@ -259,10 +272,7 @@ let diff_strings
       ~compare_assuming_text:(fun config ~prev ~next ->
           let lines_prev = lines prev in
           let lines_next = lines next in
-          let hunks = compare_lines config ~prev:lines_prev ~next:lines_next in
-          if Option.is_some patch_compatible_hunks && Option.value_exn patch_compatible_hunks
-          then convert_to_patch_compatible_hunks prev next lines_prev lines_next hunks;
-          hunks)
+          compare_lines config ~prev_diff:prev ~next_diff:next ~prev:lines_prev ~next:lines_next ())
   in
   if Comparison_result.has_no_diff hunks
   then `Same
