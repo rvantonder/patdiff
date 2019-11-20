@@ -257,13 +257,43 @@ let diff_files config ~prev_file ~next_file =
   if Comparison_result.has_no_diff hunks then `Same else `Different
 ;;
 
+(* Copied from string.ml, but preserves '\r's *)
+let split_lines_preserve_slash_r =
+  let back_up_at_newline ~t:_ ~pos ~eol =
+    pos := !pos - 1;
+    eol := !pos + 1;
+  in
+  fun t ->
+    let n = String.length t in
+    if n = 0
+    then []
+    else
+      (* Invariant: [-1 <= pos < eol]. *)
+      let pos = ref (n - 1) in
+      let eol = ref n in
+      let ac = ref [] in
+      (* We treat the end of the string specially, because if the string ends with a
+         newline, we don't want an extra empty string at the end of the output. *)
+      if Char.equal t.[!pos] '\n' then back_up_at_newline ~t ~pos ~eol;
+      while !pos >= 0 do
+        if Char.( <> ) t.[!pos] '\n'
+        then decr pos
+        else
+          (* Because [pos < eol], we know that [start <= eol]. *)
+          let start = !pos + 1 in
+          ac := String.sub t ~pos:start ~len:(!eol - start) :: !ac;
+          back_up_at_newline ~t ~pos ~eol
+      done;
+      String.sub t ~pos:0 ~len:!eol :: !ac
+;;
+
 let diff_strings
     ?print_global_header
     (config : Configuration.t)
     ~(prev : Patdiff_core.diff_input)
     ~(next : Patdiff_core.diff_input)
   =
-  let lines { Patdiff_core.name = _; text } = String.split_lines text |> Array.of_list in
+  let lines { Patdiff_core.name = _; text } = split_lines_preserve_slash_r text |> Array.of_list in
   let hunks =
     Comparison_result.create
       config
