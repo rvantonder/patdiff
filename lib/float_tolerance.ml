@@ -25,10 +25,16 @@ module String_with_floats = struct
   let float_regex =
     lazy
       (let open Re in
-       let delim = set {| ;:,(){}[]<>=+-*/|} in
+       let delim = set {| ;:,\|#&(){}[]<>~=+-*/|} in
        let prefix = group (alt [ start; char '$'; delim ]) in
        let float =
-         group (seq [ opt (char '-'); rep1 digit; opt (seq [ char '.'; rep1 digit ]) ])
+         group
+           (seq
+              [ opt (char '-')
+              ; rep1 digit
+              ; opt (seq [ char '.'; opt (rep1 digit) ])
+              ; opt (seq [ set {|eE|}; opt (set {|+-|}); rep1 digit ])
+              ])
        in
        let suffix =
          let suffix_with_delim = alt [ stop; char '%'; delim ] in
@@ -59,8 +65,35 @@ module String_with_floats = struct
   ;;
 
   include struct
-    open! Async
-    open! Expect_test_helpers
+    let%expect_test "trailing [.]" =
+      let t = create "(foo 12.)" in
+      print_s [%message (t : t)];
+      [%expect {| (t ((floats (12)) (without_floats "(foo )"))) |}]
+    ;;
+
+    let%expect_test "scientific notation" =
+      let t1 = create "(foo -12345678910.11)" in
+      let t2 = create "(foo -1.234567891011e10)" in
+      let t3 = create "(foo -1.234567891011e+10)" in
+      let t4 = create "(foo -1.234567891011E10)" in
+      let t5 = create "(foo -1.234567891011E+10)" in
+      let t6 = create "(foo -123456789101.1e-1)" in
+      let t7 = create "(foo -1234567891011.e-2)" in
+      let t8 = create "(foo -1234567891011e-2)" in
+      print_s
+        [%message
+          (t1 : t) (t2 : t) (t3 : t) (t4 : t) (t5 : t) (t6 : t) (t7 : t) (t8 : t)];
+      [%expect
+        {|
+        ((t1 ((floats (-12345678910.11)) (without_floats "(foo )")))
+         (t2 ((floats (-12345678910.11)) (without_floats "(foo )")))
+         (t3 ((floats (-12345678910.11)) (without_floats "(foo )")))
+         (t4 ((floats (-12345678910.11)) (without_floats "(foo )")))
+         (t5 ((floats (-12345678910.11)) (without_floats "(foo )")))
+         (t6 ((floats (-12345678910.11)) (without_floats "(foo )")))
+         (t7 ((floats (-12345678910.11)) (without_floats "(foo )")))
+         (t8 ((floats (-12345678910.11)) (without_floats "(foo )")))) |}]
+    ;;
 
     let%expect_test _ =
       let prev = create "(dynamic (Ok ((price_range (-18.8305 39.1095)))))\n" in
@@ -68,11 +101,11 @@ module String_with_floats = struct
       print_s [%message (prev : t) (next : t)];
       [%expect
         {|
-        ((prev (
-           (floats (-18.8305 39.1095))
+        ((prev
+          ((floats (-18.8305 39.1095))
            (without_floats "(dynamic (Ok ((price_range ( )))))\n")))
-         (next (
-           (floats (-18.772 38.988))
+         (next
+          ((floats (-18.772 38.988))
            (without_floats "(dynamic (Ok ((price_range ( )))))\n")))) |}]
     ;;
 
@@ -86,11 +119,11 @@ module String_with_floats = struct
       print_s [%message (prev : t) (next : t)];
       [%expect
         {|
-        ((prev (
-           (floats (9 30 0 16 0 0))
+        ((prev
+          ((floats (9 30 0 16 0 0))
            (without_floats "(primary_exchange_core_session (:: ::))")))
-         (next (
-           (floats (9 30 0 15 59 0))
+         (next
+          ((floats (9 30 0 15 59 0))
            (without_floats "(primary_exchange_core_session (:: ::))")))) |}]
     ;;
   end
@@ -126,6 +159,10 @@ let needleman_wunsch xs ys ~equal =
   a
 ;;
 
+type partial_range_indexes =
+  | Matching of (int * int) list
+  | Nonmatching of int list * int list
+
 (* [recover_ranges a xs ys] does the traceback step of Needleman-Wunsch to find the
    lowest-scoring [Range.t list] that transforms [xs] into [ys]. *)
 let recover_ranges xs ys a =
@@ -139,7 +176,15 @@ let recover_ranges xs ys a =
   in
   let rec traceback a i j acc =
     if i <= 0 || j <= 0
-    then acc
+    then
+      if i <= 0 && j <= 0
+      then acc
+      else (
+        let is' = List.range 0 i in
+        let js' = List.range 0 j in
+        match acc with
+        | [] | Matching _ :: _ -> Nonmatching (is', js') :: acc
+        | Nonmatching (is, js) :: acc -> Nonmatching (is' @ is, js' @ js) :: acc)
     else (
       let i', j', matched =
         match smallest a.(i - 1).(j) a.(i - 1).(j - 1) a.(i).(j - 1) with
@@ -149,31 +194,46 @@ let recover_ranges xs ys a =
         | _ -> failwith "smallest only returns 0, 1, or 2."
       in
       let acc =
-        match matched, acc with
-        | true, []
-        | true, Second _ :: _ -> First [ i - 1, j - 1 ] :: acc
-        | false, []
-        | false, First _ :: _ ->
-          Second
-            (cons_minus_one i [] ~if_unequal_to:i', cons_minus_one j [] ~if_unequal_to:j')
-          :: acc
-        | true, First ijs :: acc -> First ((i - 1, j - 1) :: ijs) :: acc
-        | false, Second (is, js) :: acc ->
-          Second
-            (cons_minus_one i is ~if_unequal_to:i', cons_minus_one j js ~if_unequal_to:j')
-          :: acc
+        if matched
+        then (
+          match acc with
+          | [] | Nonmatching _ :: _ -> Matching [ i - 1, j - 1 ] :: acc
+          | Matching ijs :: acc -> Matching ((i - 1, j - 1) :: ijs) :: acc)
+        else (
+          match acc with
+          | [] | Matching _ :: _ ->
+            Nonmatching
+              ( cons_minus_one i [] ~if_unequal_to:i'
+              , cons_minus_one j [] ~if_unequal_to:j' )
+            :: acc
+          | Nonmatching (is, js) :: acc ->
+            Nonmatching
+              ( cons_minus_one i is ~if_unequal_to:i'
+              , cons_minus_one j js ~if_unequal_to:j' )
+            :: acc)
       in
       traceback a i' j' acc)
   in
   let elts_of_indices is xs = Array.of_list is |> Array.map ~f:(Array.get xs) in
   traceback a (Array.length xs) (Array.length ys) []
   |> List.map ~f:(function
-    | First ijs ->
+    | Matching ijs ->
       let xys = Array.of_list ijs |> Array.map ~f:(fun (i, j) -> xs.(i), ys.(j)) in
       Range.Same xys
-    | Second (is, []) -> Prev (elts_of_indices is xs)
-    | Second ([], js) -> Next (elts_of_indices js ys)
-    | Second (is, js) -> Replace (elts_of_indices is xs, elts_of_indices js ys))
+    | Nonmatching (is, []) -> Prev (elts_of_indices is xs)
+    | Nonmatching ([], js) -> Next (elts_of_indices js ys)
+    | Nonmatching (is, js) -> Replace (elts_of_indices is xs, elts_of_indices js ys))
+;;
+
+let%expect_test "recover_ranges" =
+  let prev = [| "a"; "b" |] in
+  let next = [| "z" |] in
+  let a = needleman_wunsch prev next ~equal:String.equal in
+  print_s ([%sexp_of: int array array] a);
+  [%expect {| ((0 1) (1 1) (2 2)) |}];
+  let ranges = recover_ranges prev next a in
+  print_s ([%sexp_of: string Range.t list] ranges);
+  [%expect {| ((Replace (a b) (z))) |}]
 ;;
 
 let do_tolerance ~equal hunks =
@@ -228,8 +288,7 @@ end = struct
             match car, cadr with
             | Same car_lines, Same cadr_lines ->
               Skip (Same (Array.concat [ car_lines; cadr_lines ]), pos)
-            | Unified _, _
-            | _, Unified _ ->
+            | Unified _, _ | _, Unified _ ->
               raise_s
                 [%message
                   "Unexpected unified range."
@@ -245,40 +304,26 @@ end = struct
             | _, End ->
               raise_s [%message "Produced End in running step." (last : string Range.t)]
             | Same _, Start -> None
-            | (Prev _ | Next _ | Replace _), (Start | Middle)
-            | Same _, Middle -> Some (last, End))
+            | (Prev _ | Next _ | Replace _), (Start | Middle) | Same _, Middle ->
+              Some (last, End))
           ~finishing_step:(function
             | None -> Done
             | Some result -> Yield (result, None))
     ;;
 
     include struct
-      open Async
-      open Expect_test_helpers
-
       let%expect_test _ =
         let test ranges = print_s [%sexp (f ranges : t Sequence.t)] in
         let same = Range.Same [| "same", "same" |] in
         let not_same = Range.Next [| "new" |] in
         test [ same; same ];
-        let%bind () = [%expect {| () |}] in
+        [%expect {| () |}];
         test [ same; not_same; same; same; not_same; same; same ];
-        let%bind () =
-          [%expect
-            {|
-        (((Same ((same same))) Start)
-         ((Next (new)) Middle)
-         ((Same (
-            (same same)
-            (same same)))
-          Middle)
-         ((Next (new)) Middle)
-         ((Same (
-            (same same)
-            (same same)))
-          End)) |}]
-        in
-        [%expect {| |}]
+        [%expect
+          {|
+        (((Same ((same same))) Start) ((Next (new)) Middle)
+         ((Same ((same same) (same same))) Middle) ((Next (new)) Middle)
+         ((Same ((same same) (same same))) End)) |}]
       ;;
     end
   end
@@ -342,9 +387,6 @@ end = struct
     ;;
 
     include struct
-      open Async
-      open Expect_test_helpers
-
       let%expect_test _ =
         let test ranges =
           print_s [%sexp (Merged_with_position.f ranges |> f ~context:1 : t Sequence.t)]
@@ -352,7 +394,7 @@ end = struct
         let same = Range.Same [| "same", "same" |] in
         let not_same = Range.Next [| "new" |] in
         test [ same; same ];
-        let%bind () = [%expect {| () |}] in
+        [%expect {| () |}];
         test
           [ same
           ; same
@@ -367,24 +409,12 @@ end = struct
           ; same
           ; same
           ];
-        let%bind () =
-          [%expect
-            {|
-        ((Drop 1)
-         (Keep (Same ((same same))))
-         (Keep (Next (new)))
-         (Keep (
-           Same (
-             (same same)
-             (same same))))
-         (Keep (Next (new)))
-         (Keep (Same ((same same))))
-         (Drop 1)
-         (Keep (Same ((same same))))
-         (Keep (Next (new)))
-         (Keep (Same ((same same))))) |}]
-        in
-        [%expect {| |}]
+        [%expect
+          {|
+        ((Drop 1) (Keep (Same ((same same)))) (Keep (Next (new)))
+         (Keep (Same ((same same) (same same)))) (Keep (Next (new)))
+         (Keep (Same ((same same)))) (Drop 1) (Keep (Same ((same same))))
+         (Keep (Next (new))) (Keep (Same ((same same))))) |}]
       ;;
     end
   end

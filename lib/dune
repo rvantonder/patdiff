@@ -1,4 +1,3 @@
 (library (name patdiff_lib) (public_name patdiff.lib)
- (libraries core expect_test_helpers core_extended.find_files
-  shell.filename_extended patience_diff re sexplib)
+ (libraries core_kernel.composition_infix core patience_diff re)
  (preprocess (pps ppx_jane)))

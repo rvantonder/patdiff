@@ -1,6 +1,27 @@
 open Core
 open Import
 
+module File = struct
+  (** [displayed_name <> real_name] when the config specifies prev_alt or next_alt. *)
+  type t =
+    { displayed_name : string
+    ; real_name : string
+    }
+
+  let append t string =
+    { displayed_name = t.displayed_name ^/ string; real_name = t.real_name ^/ string }
+  ;;
+
+  let of_real (config : Configuration.t) which real_name =
+    let config_displayed_name =
+      match which with
+      | `Prev -> config.prev_alt
+      | `Next -> config.next_alt
+    in
+    { real_name; displayed_name = Option.value config_displayed_name ~default:real_name }
+  ;;
+end
+
 let lines_of_contents contents =
   let lines = Array.of_list (String.split_lines contents) in
   let has_trailing_newline =
@@ -14,7 +35,7 @@ let lines_of_contents contents =
 
 let%test_unit _ =
   let test contents ~expect =
-    [%test_result: string array * [`With_trailing_newline | `Missing_trailing_newline]]
+    [%test_result: string array * [ `With_trailing_newline | `Missing_trailing_newline ]]
       (lines_of_contents contents)
       ~expect
   in
@@ -82,17 +103,17 @@ let convert_to_patch_compatible_hunks ?prev_diff ?next_diff lines_prev lines_nex
             | _ -> ())
 
 (* Returns a Hunk.t list, ready to be printed *)
-let compare_lines config ?prev_diff ?next_diff ~prev ~next () =
+let compare_lines (config : Configuration.t) ?prev_diff ?next_diff ~prev ~next () =
   let module C = Configuration in
   (* Create the diff *)
-  let context = config.C.context in
-  let keep_ws = config.C.keep_ws in
-  let split_long_lines = config.C.split_long_lines in
-  let line_big_enough = config.C.line_big_enough in
+  let context = config.context in
+  let keep_ws = config.keep_ws in
+  let split_long_lines = config.split_long_lines in
+  let line_big_enough = config.line_big_enough in
   let hunks =
     let transform = if keep_ws then Fn.id else Patdiff_core.remove_ws in
     (* Use external compare program? *)
-    match config.C.ext_cmp with
+    match config.ext_cmp with
     | None ->
       Patience_diff.String.get_hunks
         ~transform
@@ -108,7 +129,8 @@ let compare_lines config ?prev_diff ?next_diff ~prev ~next () =
         | Error (`Exit_non_zero 1) -> 1
         | Error _ -> failwithf "External compare %S failed!" prog ()
       in
-      let module P = Patience_diff.Make (struct
+      let module P =
+        Patience_diff.Make (struct
           type t = string [@@deriving sexp]
 
           let hash = String.hash
@@ -118,12 +140,12 @@ let compare_lines config ?prev_diff ?next_diff ~prev ~next () =
       P.get_hunks ~transform ~context ~big_enough:line_big_enough ~prev ~next
   in
   let hunks =
-    match config.C.float_tolerance with
+    match config.float_tolerance with
     | None -> hunks
     | Some tolerance -> Float_tolerance.apply hunks tolerance ~context
   in
   (* Refine if desired *)
-  if config.C.unrefined
+  if config.unrefined
   then
     (
       (* Before turning replace ranges into `Prev and `Next, add the diff fixups *)
@@ -133,11 +155,11 @@ let compare_lines config ?prev_diff ?next_diff ~prev ~next () =
       Patience_diff.Hunks.unified hunks
     )
   else (
-    let rules = config.C.rules in
-    let output = config.C.output in
-    let produce_unified_lines = config.C.produce_unified_lines in
-    let interleave = config.C.interleave in
-    let word_big_enough = config.C.word_big_enough in
+    let rules = config.rules in
+    let output = config.output in
+    let produce_unified_lines = config.produce_unified_lines in
+    let interleave = config.interleave in
+    let word_big_enough = config.word_big_enough in
     Patdiff_core.refine
       ~rules
       ~output
@@ -167,13 +189,13 @@ let warn_if_no_trailing_newline
 ;;
 
 (* Returns a Hunk.t list, ready to be printed *)
-let compare_files (config : Configuration.t) ~prev_file ~next_file =
-  let prev = In_channel.read_all prev_file in
-  let next = In_channel.read_all next_file in
+let compare_files (config : Configuration.t) ~(prev_file : File.t) ~(next_file : File.t) =
+  let prev = In_channel.read_all prev_file.real_name in
+  let next = In_channel.read_all next_file.real_name in
   Comparison_result.create
     config
-    ~prev:{ name = prev_file; text = prev }
-    ~next:{ name = next_file; text = next }
+    ~prev:{ name = prev_file.displayed_name; text = prev }
+    ~next:{ name = next_file.displayed_name; text = next }
     ~compare_assuming_text:(fun config ~prev ~next ->
         let prev_lines, prev_file_newline = lines_of_contents prev.text in
         let next_lines, next_file_newline = lines_of_contents next.text in
@@ -211,25 +233,23 @@ let binary_different_message
 ;;
 
 (* Print hunks to stdout *)
-let print hunks ~prev_file ~next_file ~config =
-  let module C = Configuration in
+let print hunks ~(prev_file : File.t) ~(next_file : File.t) ~(config : Configuration.t) =
   if Comparison_result.has_no_diff hunks
   then (
-    if config.C.double_check
+    if config.double_check
     then (
-      match Unix.system (sprintf "cmp -s %s %s" prev_file next_file) with
+      match
+        Unix.system (sprintf "cmp -s %s %s" prev_file.real_name next_file.real_name)
+      with
       | Ok () -> ()
       | Error (`Exit_non_zero 1) ->
         printf "There are no differences except those filtered by your settings\n%!"
       | Error _ -> ()))
   else if (* Only print if -quiet is not set *)
-    not config.C.quiet
+    not config.quiet
   then (
-    let output = config.C.output in
-    let rules = config.C.rules in
-    (* Substitute prev/new_alt for the filenames in the final output *)
-    let prev_file = Option.value ~default:prev_file config.C.old_alt in
-    let next_file = Option.value ~default:next_file config.C.new_alt in
+    let output = config.output in
+    let rules = config.rules in
     match hunks with
     | Binary_same -> assert false
     | Binary_different { prev_is_binary; next_is_binary } ->
@@ -237,21 +257,23 @@ let print hunks ~prev_file ~next_file ~config =
         "%s\n"
         (binary_different_message
            ~config
-           ~prev_file
+           ~prev_file:prev_file.displayed_name
            ~prev_is_binary
-           ~next_file
+           ~next_file:next_file.displayed_name
            ~next_is_binary)
     | Hunks hunks ->
       Patdiff_core.print
         hunks
-        ~prev_file
-        ~next_file
+        ~prev_file:prev_file.displayed_name
+        ~next_file:next_file.displayed_name
         ~output
         ~rules
         ~location_style:config.location_style)
 ;;
 
 let diff_files config ~prev_file ~next_file =
+  let prev_file = File.of_real config `Prev prev_file in
+  let next_file = File.of_real config `Next next_file in
   let hunks = compare_files ~prev_file ~next_file config in
   print hunks ~prev_file ~next_file ~config;
   if Comparison_result.has_no_diff hunks then `Same else `Different
@@ -327,75 +349,122 @@ let diff_strings
            ~location_style:config.location_style)
 ;;
 
-(* True if a file is a regular file *)
-let is_reg path = (Unix.stat path).Unix.st_kind = Unix.S_REG
-let is_dir path = (Unix.stat path).Unix.st_kind = Unix.S_DIR
+let is_reg path =
+  match Unix.stat path with
+  | { st_kind = S_REG; _ } -> true
+  | _ -> false
+;;
 
-let rec diff_dirs config ~prev_file ~next_file ~file_filter =
-  let module C = Configuration in
-  (* Get a list of files for this directory only; do not descend farther
-     (We recursively call diff_dirs later if we need to descend.) *)
-  let options =
-    { Find_files.Options.default with max_depth = Some 1; filter = file_filter }
+let is_dir path =
+  match Unix.stat path with
+  | { st_kind = S_DIR; _ } -> true
+  | _ -> false
+;;
+
+let rec diff_dirs_internal
+          (config : Configuration.t)
+          ~(prev_dir : File.t)
+          ~(next_dir : File.t)
+          ~file_filter
+  =
+  assert (is_dir prev_dir.real_name);
+  assert (is_dir next_dir.real_name);
+  let set_of_dir (dir : File.t) =
+    (* Get a list of files for this directory only; do not descend farther
+       (We recursively call diff_dirs later if we need to descend.) *)
+    let file_filter =
+      match file_filter with
+      | None -> Fn.const true
+      | Some file_filter -> file_filter
+    in
+    Sys.ls_dir dir.real_name
+    |> List.filter ~f:(fun x ->
+      let x = dir.real_name ^/ x in
+      match Unix.stat x with
+      | exception Unix.Unix_error (ENOENT, _, _) ->
+        (* If the file disappeared during listing, let's pretend it didn't exist.
+           This is important when the file is [-exclude]d because we don't want to create
+           noise for excluded files, but it's also not too bad if the file is [-include]d
+        *)
+        false
+      | stats -> file_filter (x, stats))
+    |> String.Set.of_list
   in
-  let set_of_file file =
-    let files = Find_files.find_all ~options file in
-    let f (n, _s) = Filename_extended.make_relative ~to_:file n in
-    let names = List.map files ~f in
-    String.Set.of_list names
-  in
-  let prev_set = set_of_file prev_file in
-  let next_set = set_of_file next_file in
+  let prev_set = set_of_dir prev_dir in
+  let next_set = set_of_dir next_dir in
   (* Get unique files *)
   let union = Set.union prev_set next_set in
   let prev_uniques = Set.diff union next_set in
   let next_uniques = Set.diff union prev_set in
-  let handle_unique file ~dir ~is_prev =
-    printf "Only in %s: %s\n%!" dir file;
+  let handle_unique which file ~(dir : File.t) =
+    printf "Only in %s: %s\n%!" dir.displayed_name file;
     (* Diff unique files against /dev/null, if desired *)
-    if not config.C.mask_uniques
+    if not config.mask_uniques
     then (
-      let path = dir ^/ file in
+      let path = dir.real_name ^/ file in
       if is_reg path
       then (
         let diff = diff_files config in
         let null = "/dev/null" in
-        if is_prev
-        then ignore (diff ~prev_file:path ~next_file:null)
-        else ignore (diff ~prev_file:null ~next_file:path)))
+        match which with
+        | `Prev -> ignore (diff ~prev_file:path ~next_file:null : [ `Different | `Same ])
+        | `Next -> ignore (diff ~prev_file:null ~next_file:path : [ `Different | `Same ])))
   in
-  Set.iter prev_uniques ~f:(handle_unique ~dir:prev_file ~is_prev:true);
-  Set.iter next_uniques ~f:(handle_unique ~dir:next_file ~is_prev:false);
+  Set.iter prev_uniques ~f:(handle_unique `Prev ~dir:prev_dir);
+  Set.iter next_uniques ~f:(handle_unique `Next ~dir:next_dir);
   (* Get differences *)
   let inter = Set.inter prev_set next_set in
   let exit_code = ref `Same in
   let diff file =
-    let prev_file = prev_file ^/ file in
-    let next_file = next_file ^/ file in
-    if is_reg prev_file && is_reg next_file
+    let prev_file = File.append prev_dir file in
+    let next_file = File.append next_dir file in
+    if is_reg prev_file.real_name && is_reg next_file.real_name
     then (
       let hunks = compare_files ~prev_file ~next_file config in
       if not (Comparison_result.has_no_diff hunks)
       then (
         exit_code := `Different;
         (* Print the diff if not -quiet *)
-        if config.C.quiet = false
-        then print hunks ~prev_file ~next_file ~config
-        else printf "Files %s and %s differ\n%!" prev_file next_file))
-    else if is_dir prev_file && is_dir next_file
+        match config.quiet with
+        | false -> print hunks ~prev_file ~next_file ~config
+        | true ->
+          printf
+            "Files %s and %s differ\n%!"
+            prev_file.displayed_name
+            next_file.displayed_name))
+    else if is_dir prev_file.real_name && is_dir next_file.real_name
     then
-      if not config.C.shallow
+      if not config.shallow
       then (
-        match diff_dirs ~prev_file ~next_file config ~file_filter with
+        match
+          diff_dirs_internal ~prev_dir:prev_file ~next_dir:next_file config ~file_filter
+        with
         | `Same -> ()
         | `Different -> exit_code := `Different)
-      else printf "Common subdirectories: %s and %s\n%!" prev_file next_file
+      else
+        printf
+          "Common subdirectories: %s and %s\n%!"
+          prev_file.displayed_name
+          next_file.displayed_name
     else (
       exit_code := `Different;
-      printf "Files %s and %s are not the same type\n%!" prev_file next_file)
+      printf
+        "Files %s and %s are not the same type\n%!"
+        prev_file.displayed_name
+        next_file.displayed_name)
   in
   Set.iter inter ~f:diff;
   if Set.is_empty prev_uniques && Set.is_empty next_uniques
   then !exit_code
   else `Different
+;;
+
+let diff_dirs config ~prev_dir ~next_dir ~file_filter =
+  if not (is_dir prev_dir)
+  then invalid_argf "diff_dirs: prev_dir '%s' is not a directory" prev_dir ();
+  if not (is_dir next_dir)
+  then invalid_argf "diff_dirs: next_dir '%s' is not a directory" next_dir ();
+  let prev_dir = File.of_real config `Prev prev_dir in
+  let next_dir = File.of_real config `Next next_dir in
+  diff_dirs_internal config ~prev_dir ~next_dir ~file_filter
 ;;

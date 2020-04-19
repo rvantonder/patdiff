@@ -67,10 +67,8 @@ let codes_of_style : Patdiff_format.Style.t -> string = function
   | Blink -> "5"
   | Inverse -> "7"
   | Hide -> "8"
-  | Fg c
-  | Foreground c -> codes_of_foreground_color c
-  | Bg c
-  | Background c -> codes_of_background_color c
+  | Fg c | Foreground c -> codes_of_foreground_color c
+  | Bg c | Background c -> codes_of_background_color c
 ;;
 
 let apply_styles
@@ -102,7 +100,7 @@ let apply_styles
 module Rule = struct
   let apply text ~(rule : Patdiff_format.Rule.t) ~refined =
     let only_whitespace =
-      not (String.is_empty text) && String.for_all text ~f:Char.is_whitespace
+      (not (String.is_empty text)) && String.for_all text ~f:Char.is_whitespace
     in
     let text_style : Patdiff_format.Style.t list =
       if List.is_empty rule.styles
@@ -121,21 +119,30 @@ module Rule = struct
   ;;
 end
 
-let print_header ~rules ~file_names:(old_file, new_file) ~print =
+let print_header
+      ~(rules : Patdiff_format.Rules.t)
+      ~file_names:(prev_file, next_file)
+      ~print
+  =
   let print_line file rule = print (Rule.apply file ~rule ~refined:false) in
-  let module Rz = Patdiff_format.Rules in
-  print_line old_file rules.Rz.header_old;
-  print_line new_file rules.Rz.header_new
+  print_line prev_file rules.header_prev;
+  print_line next_file rules.header_next
 ;;
 
-let print ~print_global_header ~file_names ~rules ~print ~location_style hunks =
-  let module Rz = Patdiff_format.Rules in
+let print
+      ~print_global_header
+      ~file_names
+      ~(rules : Patdiff_format.Rules.t)
+      ~print
+      ~location_style
+      hunks
+  =
   let f_hunk_break hunk =
     Patdiff_format.Location_style.sprint
       location_style
       hunk
       ~prev_filename:(fst file_names)
-      ~rule:(Rule.apply ~rule:rules.Rz.hunk ~refined:false)
+      ~rule:(Rule.apply ~rule:rules.hunk ~refined:false)
     |> print
   in
   if print_global_header then print_header ~rules ~file_names ~print;
